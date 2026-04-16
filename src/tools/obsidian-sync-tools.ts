@@ -1,10 +1,11 @@
 import { z } from "zod";
 import { join } from "node:path";
 import { writeFileSync, mkdirSync } from "node:fs";
-import { VAULTS, REPOS, TEAM_MEMBERS } from "../config.js";
+import { VAULTS, REPOS, TEAM_MEMBERS, AUTHOR_ALIASES } from "../config.js";
 import { memoryClient, ContextEntry } from "../memory.js";
 import { buildKnowledgeGraph } from "../graph/builder.js";
 import { toMermaid } from "../graph/visualizer.js";
+import { GitUtils } from "../git/git-utils.js";
 
 export const SyncGraphToObsidianInputSchema = z.object({
   vault: z
@@ -51,7 +52,8 @@ function buildPersonNote(
   name: string,
   role: string | undefined,
   email: string | undefined,
-  entries: ContextEntry[]
+  entries: ContextEntry[],
+  repos: string[] = []
 ): string {
   const meetings = entries.filter(
     e => e.type === "meeting" && e.contributors?.includes(name)
@@ -67,6 +69,14 @@ function buildPersonNote(
   if (role) lines.push(`**Rol:** ${role}`);
   if (email) lines.push(`**Email:** ${email}`);
   lines.push("");
+
+  if (repos.length > 0) {
+    lines.push(`## Repositorios`, "");
+    for (const repo of repos) {
+      lines.push(`- [[${repo}]]`);
+    }
+    lines.push("");
+  }
 
   if (meetings.length > 0) {
     lines.push(`## Reuniones (${meetings.length})`, "");
@@ -98,7 +108,8 @@ function buildPersonNote(
 
 function buildRepoNote(
   repoName: string,
-  entries: ContextEntry[]
+  entries: ContextEntry[],
+  gitContributors: string[] = []
 ): string {
   const decisions = entries.filter(
     e => e.type === "decision" && e.relatedRepos?.includes(repoName)
@@ -107,8 +118,8 @@ function buildRepoNote(
     e => e.type === "meeting" && e.relatedRepos?.includes(repoName)
   );
 
-  // Unique committers to this repo (from linkedCommits across all decisions)
-  const committers = new Set<string>();
+  // Unique committers: git-based (canonical names) + memory-based
+  const committers = new Set<string>(gitContributors);
   for (const entry of entries) {
     for (const link of entry.linkedCommits ?? []) {
       if (link.repo === repoName) committers.add(link.commitAuthor);
@@ -194,7 +205,8 @@ function buildMOC(
   repos: string[],
   decisions: ContextEntry[],
   mermaidDiagram: string,
-  stats: { nodes: number; edges: number }
+  stats: { nodes: number; edges: number },
+  gitEdges: Array<{ person: string; repo: string }> = []
 ): string {
   const now = new Date().toISOString().substring(0, 16).replace("T", " ");
 
@@ -230,14 +242,52 @@ function buildMOC(
     lines.push("");
   }
 
+  // If the base graph has no edges but we have git-derived edges, build a simple diagram
+  const effectiveMermaid =
+    gitEdges.length > 0 && stats.edges === 0
+      ? buildGitMermaid(people, repos, gitEdges)
+      : mermaidDiagram;
+
   lines.push(
     "## 🔗 Knowledge Graph",
     "",
     "```mermaid",
-    mermaidDiagram,
+    effectiveMermaid,
     "```",
     ""
   );
+
+  return lines.join("\n");
+}
+
+function buildGitMermaid(
+  people: string[],
+  repos: string[],
+  edges: Array<{ person: string; repo: string }>
+): string {
+  const lines: string[] = [
+    "graph LR",
+    "  classDef person fill:#E91E63,color:#fff,stroke:#880E4F",
+    "  classDef repo fill:#9C27B0,color:#fff,stroke:#6A1B9A",
+  ];
+
+  for (const p of people) {
+    const id = `person-${p.replace(/\s+/g, "_")}`;
+    lines.push(`  ${id}(("${p}"))`);
+    lines.push(`  class ${id} person`);
+  }
+
+  for (const r of repos) {
+    const id = `repo-${r.replace(/\s+/g, "_")}`;
+    lines.push(`  ${id}[("${r}")]`);
+    lines.push(`  class ${id} repo`);
+  }
+
+  for (const edge of edges) {
+    const pId = `person-${edge.person.replace(/\s+/g, "_")}`;
+    const rId = `repo-${edge.repo.replace(/\s+/g, "_")}`;
+    lines.push(`  ${pId} --> ${rId}`);
+  }
 
   return lines.join("\n");
 }
@@ -283,13 +333,42 @@ export async function syncGraphToObsidian(
     for (const link of entry.linkedCommits ?? []) allRepos.add(link.repo);
   }
 
+  // ── Build git-based person→repo relationships ─────────────────────────────
+
+  const personRepos = new Map<string, Set<string>>(); // canonical name → repos
+  const repoContributors = new Map<string, Set<string>>(); // repo → canonical names
+  const gitEdges: Array<{ person: string; repo: string }> = [];
+
+  for (const [repoName, repoConfig] of Object.entries(REPOS)) {
+    try {
+      const git = new GitUtils(repoConfig.localPath);
+      const stats = git.getStatsThisMonth();
+      const contributors = new Set<string>();
+
+      for (const gitAuthor of Object.keys(stats.commitsByAuthor)) {
+        const canonical = AUTHOR_ALIASES[gitAuthor] ?? gitAuthor;
+        if (knownPeople.has(canonical)) {
+          contributors.add(canonical);
+          if (!personRepos.has(canonical)) personRepos.set(canonical, new Set());
+          personRepos.get(canonical)!.add(repoName);
+          gitEdges.push({ person: canonical, repo: repoName });
+        }
+      }
+
+      repoContributors.set(repoName, contributors);
+    } catch {
+      repoContributors.set(repoName, new Set());
+    }
+  }
+
   // ── Personas/ ────────────────────────────────────────────────────────────
 
   const personasDir = join(vaultPath, "Personas");
   ensureDir(personasDir);
 
   for (const [name, person] of knownPeople) {
-    const content = buildPersonNote(name, person.role, person.email, allEntries);
+    const repos = Array.from(personRepos.get(name) ?? []);
+    const content = buildPersonNote(name, person.role, person.email, allEntries, repos);
     writeNote(join(personasDir, `${name}.md`), content);
     created.push(`Personas/${name}.md`);
   }
@@ -300,7 +379,8 @@ export async function syncGraphToObsidian(
   ensureDir(reposDir);
 
   for (const repoName of allRepos) {
-    const content = buildRepoNote(repoName, allEntries);
+    const contributors = Array.from(repoContributors.get(repoName) ?? []);
+    const content = buildRepoNote(repoName, allEntries, contributors);
     writeNote(join(reposDir, `${repoName}.md`), content);
     created.push(`Repos/${repoName}.md`);
   }
@@ -331,7 +411,8 @@ export async function syncGraphToObsidian(
     Array.from(allRepos),
     decisions,
     mermaidDiagram,
-    { nodes: graph.nodes.size, edges: graph.edges.length }
+    { nodes: graph.nodes.size, edges: graph.edges.length },
+    gitEdges
   );
 
   writeNote(join(vaultPath, "_Mapa del Equipo.md"), moc);

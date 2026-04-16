@@ -49,7 +49,7 @@ export const TEAM_MEMBERS: TeamMember[] = [
   { name: "Branco",   email: process.env.TEAM_Branco_EMAIL   || "branco@dataoilers.com",   role: "" },
   { name: "Gaston",   email: process.env.TEAM_Gaston_EMAIL   || "gaston@dataoilers.com",   role: "" },
   { name: "Eliezer",  email: process.env.TEAM_Eliezer_EMAIL  || "matias.rivero@dataoilers.com", role: "" },
-];
+ ];
 
 // Obsidian Vaults
 export const VAULTS: Record<string, VaultConfig> = {
@@ -109,3 +109,19 @@ export function setRepos(repos: Record<string, RepoConfig>): void {
 export function getTeamMemberByName(name: string): TeamMember | undefined {
   return TEAM_MEMBERS.find(member => member.name === name);
 }
+
+// Maps git commit author names → canonical team member name
+export const AUTHOR_ALIASES: Record<string, string> = {
+  "emisorato1": "Emiliano",
+  "Emiliano Vicente Sorato": "Emiliano",
+  "Franco Manca": "Franco",
+  "Lautaro Sanz": "Lautaro",
+  "ËEG": "Emanuel",
+  "eeg": "Emanuel",
+  "Eneas Emanuel Gallo": "Emanuel",
+  "agustin2505": "Agustin",
+  "Gaston Garcia Juri": "Gaston",
+  "Gaston": "Gaston",
+  "branko007": "Branco",
+  "Eliezer": "Eliezer",
+};
